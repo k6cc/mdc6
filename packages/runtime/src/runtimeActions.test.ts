@@ -23,7 +23,7 @@ describe("settings parity runtime helpers", () => {
     expect(buildSiteConnectivityHeaders(Website.SOKMIL, config)).toEqual({ cookie: "AGEAUTH=ok" });
   });
 
-  it("reports when JavBus is anonymously accessible while JavDB remains unconfigured", async () => {
+  it("reports when JavBus is anonymously accessible while JavDB and Fantia remains unconfigured", async () => {
     const getText = vi.fn(async () => '<a class="movie-box" href="/ABP-123"></a>');
 
     await expect(checkConfiguredSiteCookies(cloneConfig(), { getText })).resolves.toEqual({
@@ -35,6 +35,7 @@ describe("settings parity runtime helpers", () => {
           message: "JavBus 影片页面可匿名访问，无需 Cookie",
           status: "ready_without_cookie",
         },
+        { site: "Fantia", valid: false, message: "未配置 Cookie", status: "not_configured" },
       ],
     });
     expect(getText).toHaveBeenCalledWith("https://www.javbus.com/", { headers: { ...JAVBUS_REQUEST_HEADERS } });
@@ -90,6 +91,33 @@ describe("settings parity runtime helpers", () => {
     });
   });
 
+  it.each([
+    ["dashboard", '<a href="/mypage/dashboard">My page</a>', true, "ready_with_cookie", "Cookie 有效"],
+    ["login wall", '<form><input type="password" /></form>', false, "invalid_or_expired", "Cookie 无效或已过期"],
+    [
+      "unexpected page",
+      "<main>temporarily unavailable</main>",
+      false,
+      "unexpected_page",
+      "Fantia 页面未返回可识别的登录状态，请稍后重试。",
+    ],
+  ] as const)("classifies Fantia %s instead of treating arbitrary HTML as a valid Cookie", async (_name, html, valid, status, message) => {
+    const config = cloneConfig();
+    config.network.fantiaCookie = "fantia_session=valid";
+    const getText = vi.fn(async (url: string) =>
+      url === "https://fantia.jp/mypage/dashboard" ? html : '<a class="movie-box" />',
+    );
+
+    const result = await checkConfiguredSiteCookies(config, { getText });
+
+    expect(result.results.find((entry) => entry.site === "Fantia")).toEqual({
+      site: "Fantia",
+      valid,
+      message,
+      status,
+    });
+  });
+
   it("does not expose a configured JavBus Cookie when the probe fails", async () => {
     const config = cloneConfig();
     config.network.javbusCookie = "javbus_session=secret-token; other=second-secret";
@@ -109,7 +137,10 @@ describe("settings parity runtime helpers", () => {
 
   it("uses Desktop LLM validation semantics before sending a request", async () => {
     const config = cloneConfig();
-    const llmApiClient = { generateText: vi.fn().mockResolvedValue("ok") } as unknown as LlmApiClient;
+    const llmApiClient = {
+      generateText: vi.fn().mockResolvedValue("ok"),
+    } as unknown as LlmApiClient;
+    const logger = { error: vi.fn(), info: vi.fn() };
 
     await expect(testLlmConnectivity({ llmModelName: "" }, config, llmApiClient)).resolves.toEqual({
       success: false,
@@ -119,16 +150,26 @@ describe("settings parity runtime helpers", () => {
 
     config.translate.llmBaseUrl = "https://example.test/v1";
     await expect(
-      testLlmConnectivity({ llmModelName: "gpt-test", llmPrompt: "{lang}:{content}" }, config, llmApiClient),
+      testLlmConnectivity(
+        { llmModelName: "gpt-test", llmPrompt: "{lang}:{content}", llmTemperature: 1.5 },
+        config,
+        llmApiClient,
+        logger,
+      ),
     ).resolves.toEqual({ success: true, message: "连接成功，LLM 回复: ok" });
     expect(llmApiClient.generateText).toHaveBeenCalledWith(
       expect.objectContaining({
         baseUrl: "https://example.test/v1",
         model: "gpt-test",
-        prompt: "简体中文:ある日の暮方の事である。",
+        prompt: expect.stringContaining("简体中文:ある日の暮方の事である。"),
+        temperature: 0,
         timeout: 10_000,
       }),
+      undefined,
     );
+    expect(logger.info).toHaveBeenCalledWith("Test LLM connectivity: Success");
+    expect(JSON.stringify(logger.info.mock.calls)).not.toContain('reply="ok"');
+    expect(JSON.stringify(logger.error.mock.calls)).not.toContain('reply="ok"');
   });
 
   it("creates the server-side watermark directory under runtime data", async () => {

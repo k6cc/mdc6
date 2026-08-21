@@ -6,11 +6,12 @@ import type { Configuration } from "@mdcz/shared/config";
 import type { CrawlerData, DownloadedAssets, FileInfo, NfoLocalState, ScrapeResult } from "@mdcz/shared/types";
 import { NetworkClient, type RuntimeDownloadNetworkClient } from "../network";
 import { ActorImageService } from "./ActorImageService";
+import type { RuntimeActorSourceProvider } from "./actorOutput";
 import type { AggregationResult, ManualScrapeOptions } from "./aggregation";
-import { DownloadManager } from "./download";
-import { FileOrganizer } from "./FileOrganizer";
+import { DownloadManager, type ImageHostCooldownStore, MemoryImageHostCooldownStore } from "./download";
+import { FileOrganizer, resolveMetadataOutputDir } from "./FileOrganizer";
 import { FileScraper } from "./FileScraper";
-import { NfoGenerator, reconcileExistingNfoFiles } from "./nfo";
+import { NfoGenerator, nfoIgnoreFieldsToEnabledFields, reconcileExistingNfoFiles } from "./nfo";
 import { prepareCrawlerDataForMovieOutput } from "./output/prepareCrawlerDataForMovieOutput";
 import { prepareImageAlternativesForDownload } from "./output/prepareImageAlternativesForDownload";
 import {
@@ -33,6 +34,7 @@ import {
   TranslateStage,
 } from "./pipeline";
 import { TranslateService } from "./TranslateService";
+import type { TranslationMappingStore } from "./translate/types";
 import { isAbortError } from "./utils/abort";
 import { pathExists } from "./utils/filesystem";
 import { parseFileInfo } from "./utils/number";
@@ -84,7 +86,7 @@ export interface MountedRootScrapeRuntimeItemSuccess {
   status: "success";
   result: ScrapeResult;
   crawlerData: CrawlerData;
-  nfoRelativePath: string | null;
+  nfoPath: string | null;
   outputRelativePath: string;
   size: number;
   modifiedAt: Date | null;
@@ -99,44 +101,6 @@ export interface MountedRootScrapeRuntimeItemFailure {
 export type MountedRootScrapeRuntimeItemResult =
   | MountedRootScrapeRuntimeItemSuccess
   | MountedRootScrapeRuntimeItemFailure;
-
-class MemoryImageHostCooldownStore {
-  private readonly entries = new Map<string, { failures: number[]; cooldownUntil?: number }>();
-
-  getActiveCooldown(key: string): { cooldownUntil: number; remainingMs: number } | null {
-    const entry = this.entries.get(key);
-    const cooldownUntil = entry?.cooldownUntil;
-    if (!cooldownUntil) {
-      return null;
-    }
-    const remainingMs = cooldownUntil - Date.now();
-    if (remainingMs <= 0) {
-      this.reset(key);
-      return null;
-    }
-    return { cooldownUntil, remainingMs };
-  }
-
-  isCoolingDown(key: string): boolean {
-    return this.getActiveCooldown(key) !== null;
-  }
-
-  recordFailure(
-    key: string,
-    policy: { threshold: number; windowMs: number; cooldownMs: number },
-  ): { cooldownUntil?: number | null; failureCount: number } | null {
-    const now = Date.now();
-    const entry = this.entries.get(key) ?? { failures: [] };
-    const failures = [...entry.failures.filter((timestamp) => now - timestamp <= policy.windowMs), now];
-    const cooldownUntil = failures.length >= policy.threshold ? now + policy.cooldownMs : entry.cooldownUntil;
-    this.entries.set(key, { failures, cooldownUntil });
-    return { cooldownUntil, failureCount: failures.length };
-  }
-
-  reset(key: string): void {
-    this.entries.delete(key);
-  }
-}
 
 class MountedRootScrapeSignalService implements RuntimeScrapeSignalService {
   private readonly pending = new Set<Promise<void>>();
@@ -213,13 +177,16 @@ class MountedRootFileScraperPipeline implements FileScraperPipeline {
     private readonly logger: MountedRootScrapeLogger,
     networkClient?: RuntimeDownloadNetworkClient,
     private readonly localState?: NfoLocalState,
+    mappingStore?: TranslationMappingStore,
+    imageHostCooldownStore: ImageHostCooldownStore = new MemoryImageHostCooldownStore(),
+    private readonly actorSourceProvider?: RuntimeActorSourceProvider,
   ) {
     this.networkClient = networkClient ?? new NetworkClient();
     const runtimeLogger = toRuntimeLogger(this.logger);
     this.fileOrganizer = new FileOrganizer(runtimeLogger);
-    this.translateService = new TranslateService(this.networkClient, { logger: runtimeLogger });
+    this.translateService = new TranslateService(this.networkClient, { logger: runtimeLogger, mappingStore });
     this.downloadManager = new DownloadManager(this.networkClient, {
-      imageHostCooldownStore: new MemoryImageHostCooldownStore(),
+      imageHostCooldownStore,
       logger: runtimeLogger,
     });
     this.actorImageService = new ActorImageService({
@@ -231,12 +198,13 @@ class MountedRootFileScraperPipeline implements FileScraperPipeline {
     this.stages = this.createStages();
   }
 
-  createContext(
+  async createContext(
     filePath: string,
     progress: { fileIndex: number; totalFiles: number } = { fileIndex: 1, totalFiles: 1 },
     options: Parameters<FileScraperPipeline["createContext"]>[2] = {},
-  ): ScrapeContext {
-    return new ScrapeContext(filePath, progress, "batch", options.manualScrape);
+  ): Promise<ScrapeContext> {
+    const configuration = await this.getConfiguration();
+    return new ScrapeContext(filePath, progress, "batch", options.manualScrape, configuration);
   }
 
   setProgress(progress: { fileIndex: number; totalFiles: number }, stepPercent: number): void {
@@ -291,6 +259,7 @@ class MountedRootFileScraperPipeline implements FileScraperPipeline {
   private createStageRuntime(): FileScraperStageRuntime {
     return {
       actorImageService: this.actorImageService,
+      actorSourceProvider: this.actorSourceProvider,
       fileOrganizer: this.fileOrganizer,
       logger: this.logger,
       nfoGenerator: this.nfoGenerator,
@@ -325,8 +294,9 @@ class MountedRootFileScraperPipeline implements FileScraperPipeline {
           context.requireCrawlerData(),
           {
             enabled: true,
-            movieDir: context.requirePlan().outputDir,
+            movieDir: resolveMetadataOutputDir(context.requirePlan()),
             sourceVideoPath: context.fileInfo.filePath,
+            actorSourceProvider: this.actorSourceProvider,
             signal,
           },
         );
@@ -404,7 +374,7 @@ class MountedRootFileScraperPipeline implements FileScraperPipeline {
     );
     let resolvedSceneImageUrls: string[] | undefined;
     const assets = await this.downloadManager.downloadAll(
-      context.requirePlan().outputDir,
+      resolveMetadataOutputDir(context.requirePlan()),
       crawlerData,
       context.requireConfiguration(),
       preparedImageAlternatives,
@@ -450,6 +420,7 @@ class MountedRootFileScraperPipeline implements FileScraperPipeline {
       fileInfo: context.fileInfo,
       localState: context.existingNfoLocalState,
       nfoNaming: configuration.download.nfoNaming,
+      enabledFields: nfoIgnoreFieldsToEnabledFields(configuration.download.nfoIgnoreFields),
       nfoTitleTemplate: configuration.naming.nfoTitleTemplate,
       sources: context.requireAggregationResult().sources,
       videoMeta: context.videoMeta,
@@ -463,6 +434,9 @@ export class MountedRootScrapeRuntime {
     private readonly aggregationService: MountedRootScrapeAggregationService,
     private readonly logger: MountedRootScrapeLogger = console,
     private readonly networkClient?: RuntimeDownloadNetworkClient,
+    private readonly mappingStore?: TranslationMappingStore,
+    private readonly imageHostCooldownStore?: ImageHostCooldownStore,
+    private readonly actorSourceProvider?: RuntimeActorSourceProvider,
   ) {}
 
   async scrape(input: MountedRootScrapeRuntimeItemInput): Promise<MountedRootScrapeRuntimeItemResult> {
@@ -484,6 +458,9 @@ export class MountedRootScrapeRuntime {
           this.logger,
           this.networkClient,
           input.localState,
+          this.mappingStore,
+          this.imageHostCooldownStore,
+          this.actorSourceProvider,
         ),
       );
       const absolutePath = resolveRootRelativePath(input.root, input.relativePath);
@@ -505,7 +482,7 @@ export class MountedRootScrapeRuntime {
         status: "success",
         result,
         crawlerData: result.crawlerData,
-        nfoRelativePath: result.nfoPath ? toRootRelativePath(input.root, result.nfoPath) : null,
+        nfoPath: result.nfoPath ?? null,
         outputRelativePath: toRootRelativePath(input.root, outputVideoPath),
         size: stats?.size ?? 0,
         modifiedAt: stats?.mtime ?? null,

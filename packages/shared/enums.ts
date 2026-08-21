@@ -3,6 +3,7 @@ export enum Website {
   DMM = "dmm",
   DMM_TV = "dmm_tv",
   FALENO = "faleno",
+  FANTIA = "fantia",
   FC2 = "fc2",
   FC2HUB = "fc2hub",
   H0930 = "h0930",
@@ -20,6 +21,9 @@ export enum Website {
   AVBASE = "avbase",
   AVWIKIDB = "avwikidb",
 }
+export const FC2_SITE_WHITELIST = new Set<Website>([Website.FC2, Website.FC2HUB, Website.PPVDATABANK, Website.JAVDB]);
+export const FC2_ONLY_SITES = new Set<Website>([Website.FC2, Website.FC2HUB, Website.PPVDATABANK]);
+export const DMM_FAMILY_SITES = new Set<Website>([Website.DMM, Website.DMM_TV]);
 
 export enum ProxyType {
   NONE = "none",

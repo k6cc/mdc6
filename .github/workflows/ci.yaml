@@ -6,6 +6,8 @@ on:
     paths:
       - "apps/**"
       - "packages/**"
+      - ".github/workflows/ci.yaml"
+      - ".github/actions/setup/action.yml"
       - "tests/**"
       - "docs/**"
       - "CONTRIBUTING.md"
@@ -20,6 +22,10 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   static:
     name: Static Quality
@@ -27,10 +33,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
-
-      - uses: jdx/mise-action@v4
-
-      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/setup
 
       - run: pnpm typecheck
 
@@ -42,10 +45,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
-
-      - uses: jdx/mise-action@v4
-
-      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/setup
 
       - run: pnpm test:unit
 
@@ -55,10 +55,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
-
-      - uses: jdx/mise-action@v4
-
-      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/setup
 
       - name: Node, Desktop, and shared contract integration
         run: pnpm test:integration
@@ -69,10 +66,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
-
-      - uses: jdx/mise-action@v4
-
-      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/setup
 
       - name: Install Chromium
         run: pnpm exec playwright install --with-deps chromium
@@ -95,13 +89,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
-
-      - uses: jdx/mise-action@v4
-
-      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/setup
 
       - name: Enforce the core source coverage baseline
         run: pnpm test:coverage
+
+      - name: Enforce the Desktop main coverage baseline
+        run: pnpm test:coverage:desktop
 
       - name: Upload coverage report
         if: always()
@@ -118,10 +112,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
-
-      - uses: jdx/mise-action@v4
-
-      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/setup
 
       - name: Install Chromium
         run: pnpm exec playwright install --with-deps chromium
@@ -147,9 +138,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
-
-      - uses: jdx/mise-action@v4
-
-      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/setup
 
       - run: pnpm build:desktop && pnpm build:webui
